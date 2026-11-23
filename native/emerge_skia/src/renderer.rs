@@ -6993,12 +6993,19 @@ fn draw_image_with_fit(
             let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
 
             let src_rect = fitted_raster_source_rect(image, source_width, source_height, &rects);
+            let fit_rect = Rect::from_xywh(rects.dst_x, rects.dst_y, rects.dst_w, rects.dst_h);
+            // A 1:1 draw, such as a video frame, stays sharp: the bleed would resample it.
+            let bleed = if draws_one_to_one(canvas, fit_rect, src_rect) {
+                0.0
+            } else {
+                image_bleed_device_outset
+            };
             let dst_rect = maybe_expand_fit_dst_rect(
                 canvas,
-                Rect::from_xywh(rects.dst_x, rects.dst_y, rects.dst_w, rects.dst_h),
+                fit_rect,
                 Rect::from_xywh(x, y, w, h),
                 spec.fit,
-                image_bleed_device_outset,
+                bleed,
             );
             draw_image_rect_with_optional_template_tint(
                 canvas,
@@ -7127,12 +7134,19 @@ fn draw_image_with_fit_profiled(
             let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
 
             let src_rect = fitted_raster_source_rect(image, source_width, source_height, &rects);
+            let fit_rect = Rect::from_xywh(rects.dst_x, rects.dst_y, rects.dst_w, rects.dst_h);
+            // A 1:1 draw, such as a video frame, stays sharp: the bleed would resample it.
+            let bleed = if draws_one_to_one(canvas, fit_rect, src_rect) {
+                0.0
+            } else {
+                image_bleed_device_outset
+            };
             let dst_rect = maybe_expand_fit_dst_rect(
                 canvas,
-                Rect::from_xywh(rects.dst_x, rects.dst_y, rects.dst_w, rects.dst_h),
+                fit_rect,
                 Rect::from_xywh(x, y, w, h),
                 spec.fit,
-                image_bleed_device_outset,
+                bleed,
             );
             profile.draw_width = dst_rect.width().ceil().max(0.0) as u32;
             profile.draw_height = dst_rect.height().ceil().max(0.0) as u32;
@@ -7323,6 +7337,41 @@ fn maybe_expand_draw_rect(
     image_bleed_device_outset: f32,
 ) -> Rect {
     maybe_expand_draw_rect_axes(canvas, rect, image_bleed_device_outset, true, true)
+}
+
+/// Whether `dst` covers exactly one device pixel per pixel of `src`, on whole device pixels, also
+/// under a quarter-turn output rotation.
+fn draws_one_to_one(canvas: &skia_safe::Canvas, dst: Rect, src: Rect) -> bool {
+    let matrix = canvas.local_to_device_as_3x3();
+    let (device, _) = matrix.map_rect(dst);
+    let same = |a: f32, b: f32| (a - b).abs() < 0.001;
+
+    rect_on_device_pixels(&matrix, dst)
+        && ((same(device.width(), src.width()) && same(device.height(), src.height()))
+            || (same(device.width(), src.height()) && same(device.height(), src.width())))
+}
+
+/// Whether `rect` maps to whole device pixels with edges along the axes.
+fn rect_on_device_pixels(matrix: &Matrix, rect: Rect) -> bool {
+    let (device, _) = matrix.map_rect(rect);
+    let whole = |v: f32| v.is_finite() && (v - v.round()).abs() < 0.001;
+    let corner = |p: Point| {
+        (p.x - device.left()).abs().min((p.x - device.right()).abs()) < 0.001
+            && (p.y - device.top()).abs().min((p.y - device.bottom()).abs()) < 0.001
+    };
+
+    whole(device.left())
+        && whole(device.top())
+        && whole(device.right())
+        && whole(device.bottom())
+        && [
+            Point::new(rect.left(), rect.top()),
+            Point::new(rect.right(), rect.top()),
+            Point::new(rect.left(), rect.bottom()),
+            Point::new(rect.right(), rect.bottom()),
+        ]
+        .into_iter()
+        .all(|p| corner(matrix.map_point(p)))
 }
 
 fn maybe_expand_draw_rect_axes(
@@ -8691,6 +8740,30 @@ fn border_edge_clip_quads(rect: RectSpec, insets: EdgeInsets) -> [(f32, [(f32, f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rect_on_device_pixels_only_for_whole_axis_aligned_pixels() {
+        let frame = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+        assert!(rect_on_device_pixels(&Matrix::new_identity(), frame));
+        assert!(!rect_on_device_pixels(
+            &Matrix::new_identity(),
+            Rect::from_xywh(0.5, 0.0, 10.0, 10.0)
+        ));
+
+        // A 1280 x 800 layout on an 800 x 1280 panel, turned a quarter.
+        let mut quarter = Matrix::new_identity();
+        quarter.set_rotate(90.0, None);
+        quarter.post_translate((800.0, 0.0));
+        assert!(rect_on_device_pixels(&quarter, frame));
+
+        let mut tilted = Matrix::new_identity();
+        tilted.set_rotate(30.0, None);
+        assert!(!rect_on_device_pixels(&tilted, frame));
+        assert!(!rect_on_device_pixels(
+            &Matrix::scale((1.5, 1.5)),
+            Rect::from_xywh(0.0, 0.0, 3.0, 3.0)
+        ));
+    }
     use crate::render_scene::{PaintLayerPlacement, PaintLayerReason};
 
     #[test]
